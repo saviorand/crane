@@ -9,7 +9,7 @@
       fields, plus a public pointer alias [type T[A any] = *tImpl[A]].
     - All-nullary inductives (enums) map to [type T int] + iota [const] blocks.
     - Records map to plain Go structs with named fields.
-    - Pattern matching becomes [switch _scrut._v { case N: ... }] wrapped in
+    - Pattern matching becomes [switch scrut.tag { case N: ... }] wrapped in
       an immediately-invoked function expression (IIFE) when in expression
       context.
     - Curried lambdas are collected and emitted as a single multi-parameter
@@ -114,8 +114,6 @@ let go_keywords =
       "append"; "cap"; "clear"; "close"; "complex"; "copy"; "delete";
       "imag"; "len"; "make"; "max"; "min"; "new"; "panic"; "print";
       "println"; "real"; "recover";
-      (* Our own synthetic names *)
-      "_v";
     ]
     Id.Set.empty
 
@@ -366,13 +364,13 @@ let pp_go_targs ids =
    Expression pretty-printing
    =================================================================== *)
 
-(** Counter for unique scrutinee variable names to avoid shadowing in
-    nested pattern matches. *)
+(** Counter for unique scrutinee variable names ([scrut1], [scrut2], …)
+    to avoid shadowing in nested pattern matches. *)
 let scrut_counter = ref 0
 
 let fresh_scrut () =
   incr scrut_counter;
-  Id.of_string ("_scrut" ^ string_of_int !scrut_counter)
+  Id.of_string ("scrut" ^ string_of_int !scrut_counter)
 
 (** Reset the scrutinee counter between extraction passes. *)
 let reset_scrut_counter () = scrut_counter := 0
@@ -893,8 +891,7 @@ and pp_go_case env par ty ?(exp_ty : ml_type = Taxiom) scrut branches =
         if scrut_is_any then
           match record_type_name with
           | Some tn ->
-            str "\tvar _rbox any = " ++ pp_sc ++ fnl ()
-            ++ str ("\t" ^ sv_s ^ " := _rbox.(" ^ tn ^ ")") ++ fnl ()
+            str ("\t" ^ sv_s ^ " := any(") ++ pp_sc ++ str (").(" ^ tn ^ ")") ++ fnl ()
           | None ->
             str ("\t" ^ sv_s ^ " := ") ++ pp_sc ++ fnl ()
         else
@@ -917,7 +914,7 @@ and pp_go_case env par ty ?(exp_ty : ml_type = Taxiom) scrut branches =
       let all_nullary =
         Array.for_all (fun (ids, _, _, _) -> ids = []) branches
       in
-      let switch_expr = if all_nullary then sv_s else sv_s ^ "._v" in
+      let switch_expr = if all_nullary then sv_s else sv_s ^ ".tag" in
       (* For non-enum structural matches, box the scrutinee through [any] and
          type-assert to the concrete (non-generic) impl pointer.  This is
          required when the scrutinee variable is typed [any] in Go because the
@@ -946,8 +943,7 @@ and pp_go_case env par ty ?(exp_ty : ml_type = Taxiom) scrut branches =
         else
           match get_impl_from_branches () with
           | Some impl_name ->
-            str "\tvar _box any = " ++ pp_sc ++ fnl ()
-            ++ str ("\t" ^ sv_s ^ " := _box.(*" ^ impl_name ^ ")") ++ fnl ()
+            str ("\t" ^ sv_s ^ " := any(") ++ pp_sc ++ str (").(*" ^ impl_name ^ ")") ++ fnl ()
           | None ->
             (* Custom or unrecognised inductive: plain assignment.
                If the scrutinee is [any], accessing [._v] will fail at compile
@@ -1021,7 +1017,7 @@ and pp_go_branch env sv_s ?(is_enum = false) ?(case_ty : ml_type = Taxiom) (ids,
         let orig_mid = List.nth ids_orig k in
         if orig_mid = Dummy then mt ()
         else begin
-          let field_access = Printf.sprintf "%s._c%d_d%d" sv_s j k in
+          let field_access = Printf.sprintf "%s.c%df%d" sv_s j k in
           (* The impl struct fields are typed [any].
              If the variable's ML type is concrete (not opaque), add a type
              assertion at the assignment so Go infers the concrete type.
@@ -1142,7 +1138,7 @@ and pp_go_custom_match env par ?(exp_ty : ml_type = Taxiom) scrut branches =
        identifier character), followed by " :=".  Names like "_scrut0" are
        not matched because "scrut" is not all-digits.
        Examples fixed: "_ :=", "_0 :=", "_1 :=" → "_ =".
-       Examples preserved: "_su_ :=", "_scrut0 :=". *)
+       Examples preserved: "_su_ :=". *)
     let s    = Buffer.contents buf in
     let slen = String.length s in
     let is_id_char c =
@@ -1304,14 +1300,14 @@ let pp_go_ind_packet kn ind_idx ind ip =
        struct is produced or consumed through an [any]-typed variable.
        The public alias remains generic so call sites can write list[cell] etc.,
        but all instantiations share the same underlying ptr-to-impl type.
-       Scrutinee boxing in pp_go_case uses _box.( star-impl) without
+       Scrutinee boxing in pp_go_case uses any(scrut).(ptr-to-impl) without
        needing to know the type argument. *)
 
     (* 1. Impl struct: non-generic, all fields typed [any] *)
     let field_lines =
       Array.mapi (fun j ctypes ->
         List.mapi (fun k _ ->
-          str (Printf.sprintf "\t_c%d_d%d any" j k) ++ fnl ()
+          str (Printf.sprintf "\tc%df%d any" j k) ++ fnl ()
         ) ctypes
       ) ip.ip_types
       |> Array.to_list
@@ -1320,7 +1316,7 @@ let pp_go_ind_packet kn ind_idx ind ip =
     let pp_impl =
       str "type " ++ str impl_name
       ++ str " struct {" ++ fnl ()
-      ++ str "\t_v int" ++ fnl ()
+      ++ str "\ttag int" ++ fnl ()
       ++ prlist Fun.id field_lines
       ++ str "}" ++ fnl2 ()
     in
@@ -1344,7 +1340,7 @@ let pp_go_ind_packet kn ind_idx ind ip =
           in
           ignore cname;  (* silence unused-variable warning *)
           let n_params   = List.length ctypes in
-          let init_v     = "_v: " ^ string_of_int j in
+          let init_v     = "tag: " ^ string_of_int j in
           if n_params = 0 then begin
             (* Zero-arg constructor → package-level var *)
             let init_s = "{" ^ init_v ^ "}" in
@@ -1364,7 +1360,7 @@ let pp_go_ind_packet kn ind_idx ind ip =
             in
             let ret_ty = str ("*" ^ impl_name) in
             let init_fs  = List.mapi (fun k pn ->
-              Printf.sprintf "_c%d_d%d: %s" j k pn) param_names in
+              Printf.sprintf "c%df%d: %s" j k pn) param_names in
             let init_s   = String.concat ", " (init_v :: init_fs) in
             str "func " ++ str cname_s
             ++ str "(" ++ pp_params ++ str ") " ++ ret_ty ++ str " {" ++ fnl ()
