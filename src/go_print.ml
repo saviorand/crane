@@ -974,7 +974,7 @@ and pp_go_case env par ty ?(exp_ty : ml_type = Taxiom) scrut branches =
     [case_ty] – expected return type of the branch body, propagated from
                 the enclosing [pp_go_case] so that type assertions are
                 inserted where needed. *)
-and pp_go_branch env sv_s ?(is_enum = false) ?(case_ty : ml_type = Taxiom) (ids, _, pat, body) =
+and pp_go_branch env sv_s ?(indent="\t") ?(is_enum = false) ?(case_ty : ml_type = Taxiom) (ids, _, pat, body) =
   let ids_orig  = List.map fst ids in   (* original mlidents, to detect Dummy *)
   let ids_typed = List.map (fun (mid, ty) -> (id_of_mlident mid, ty)) ids in
   (* ids_typed is in constructor-arg order (first arg first).
@@ -987,10 +987,11 @@ and pp_go_branch env sv_s ?(is_enum = false) ?(case_ty : ml_type = Taxiom) (ids,
      These types are used by [MLrel] to decide whether to insert a type
      assertion when the variable is used in a typed context. *)
   List.iter (fun (id', ty) -> register_var_type id' ty) renamed;
+  let body_indent = indent ^ "\t" in
   match pat with
   | Pwild ->
-    str "\tdefault:" ++ fnl ()
-    ++ pp_go_stmts env' ~indent:"\t\t" ~exp_ty:case_ty body
+    str (indent ^ "default:") ++ fnl ()
+    ++ pp_go_stmts env' ~indent:body_indent ~exp_ty:case_ty body
 
   | Pusual r | Pcons (r, _) ->
     let j = match r with
@@ -1007,9 +1008,9 @@ and pp_go_branch env sv_s ?(is_enum = false) ?(case_ty : ml_type = Taxiom) (ids,
             else pp_global_name Cons r
           | _ -> string_of_int j
         in
-        str ("\tcase " ^ cname ^ ":") ++ fnl ()
+        str (indent ^ "case " ^ cname ^ ":") ++ fnl ()
       else
-        str (Printf.sprintf "\tcase %d:" j) ++ fnl ()
+        str (Printf.sprintf "%scase %d:" indent j) ++ fnl ()
     in
     let pp_assigns =
       List.mapi (fun k (id', ty) ->
@@ -1032,18 +1033,18 @@ and pp_go_branch env sv_s ?(is_enum = false) ?(case_ty : ml_type = Taxiom) (ids,
               Printf.sprintf "(%s).(%s)" field_access
                 (string_of_ppcmds (pp_go_type ty))
           in
-          str (Printf.sprintf "\t\t%s := %s" (Id.to_string id') rhs) ++ fnl ()
+          str (Printf.sprintf "%s%s := %s" body_indent (Id.to_string id') rhs) ++ fnl ()
         end
       ) renamed
     in
     case_label
     ++ prlist Fun.id pp_assigns
-    ++ pp_go_stmts env' ~indent:"\t\t" ~exp_ty:case_ty body
+    ++ pp_go_stmts env' ~indent:body_indent ~exp_ty:case_ty body
 
   | Ptuple _ | Prel _ ->
     (* Fallback for non-standard patterns *)
-    str "\t/* unsupported pattern */" ++ fnl ()
-    ++ str "\tdefault: return nil"
+    str (indent ^ "/* unsupported pattern */") ++ fnl ()
+    ++ str (indent ^ "default: return nil")
 
 (** Apply a custom match template (from Extract Inductive ... match).
     [exp_ty] – expected return type, propagated to branch bodies. *)
@@ -1222,6 +1223,109 @@ and pp_go_fix env par ?(exp_ty : ml_type = Taxiom) i defs bodies =
   in
   if par then str "(" ++ result ++ str ")" else result
 
+(** Emit a non-custom MLcase as flat Go statements (no IIFE wrapper).
+    Mirrors [pp_go_case] but emits the switch directly at [indent] level,
+    delegating branch bodies to [pp_go_stmts] instead of [pp_go_expr]. *)
+and pp_go_case_stmts env ~indent ~(exp_ty : ml_type) _ty scrut branches =
+  let sv   = fresh_scrut () in
+  let sv_s = Id.to_string sv in
+  let pp_sc = pp_go_expr env false scrut in
+  let get_record_fields () =
+    Array.fold_left (fun acc (_, _, pat, _) ->
+      match acc with Some _ -> acc | None ->
+      match pat with
+      | Pusual (GlobRef.ConstructRef ((kn2, ii2), _))
+      | Pcons  (GlobRef.ConstructRef ((kn2, ii2), _), _) ->
+        Hashtbl.find_opt go_record_ind_fields (GlobRef.IndRef (kn2, ii2))
+      | _ -> None
+    ) None branches
+  in
+  match get_record_fields () with
+  | Some field_info ->
+    let rec first_ctor_branch i =
+      if i >= Array.length branches then branches.(0)
+      else match branches.(i) with
+        | (_, _, Pwild, _) -> first_ctor_branch (i + 1)
+        | br -> br
+    in
+    let (ids, _, _, body) = first_ctor_branch 0 in
+    let ids_orig = List.map fst ids in
+    let ids_typed = List.map (fun (mid, ty') -> (id_of_mlident mid, ty')) ids in
+    let renamed_rev, env' = push_vars' (List.rev ids_typed) env in
+    let renamed = List.rev renamed_rev in
+    List.iteri (fun k (id', _) ->
+      let field_ty = match List.nth_opt field_info k with
+        | Some (_, ty) -> ty | None -> Taxiom
+      in
+      register_var_type id' field_ty
+    ) renamed;
+    let record_type_name =
+      Array.fold_left (fun acc (_, _, pat, _) ->
+        match acc with Some _ -> acc | None ->
+        match pat with
+        | Pusual (GlobRef.ConstructRef ((kn2, ii2), _))
+        | Pcons  (GlobRef.ConstructRef ((kn2, ii2), _), _) ->
+          Some (pp_global_name Type (GlobRef.IndRef (kn2, ii2)))
+        | _ -> None
+      ) None branches
+    in
+    let scrut_is_any = match scrut with
+      | MLrel n -> Hashtbl.mem go_any_typed_vars (get_db_name n env)
+      | _ -> false
+    in
+    let scrut_setup =
+      if scrut_is_any then
+        match record_type_name with
+        | Some tn ->
+          str (indent ^ sv_s ^ " := any(") ++ pp_sc ++ str (").(" ^ tn ^ ")") ++ fnl ()
+        | None -> str (indent ^ sv_s ^ " := ") ++ pp_sc ++ fnl ()
+      else str (indent ^ sv_s ^ " := ") ++ pp_sc ++ fnl ()
+    in
+    let pp_assigns = List.mapi (fun k (id', _) ->
+      if List.nth ids_orig k = Dummy then mt ()
+      else
+        let (fname, _) = match List.nth_opt field_info k with
+          | Some fi -> fi | None -> ("_f" ^ string_of_int k, Taxiom)
+        in
+        str (Printf.sprintf "%s%s := %s.%s" indent (Id.to_string id') sv_s fname) ++ fnl ()
+    ) renamed in
+    scrut_setup ++ prlist Fun.id pp_assigns
+    ++ pp_go_stmts env' ~indent ~exp_ty body
+
+  | None ->
+    let all_nullary = Array.for_all (fun (ids, _, _, _) -> ids = []) branches in
+    let switch_expr = if all_nullary then sv_s else sv_s ^ ".tag" in
+    let get_impl_from_branches () =
+      Array.fold_left (fun acc (_, _, pat, _) ->
+        match acc with Some _ -> acc | None ->
+        match pat with
+        | Pusual (GlobRef.ConstructRef ((kn2, ii2), _))
+        | Pcons  (GlobRef.ConstructRef ((kn2, ii2), _), _) ->
+          let ind_ref2 = GlobRef.IndRef (kn2, ii2) in
+          if is_custom ind_ref2 then None
+          else Some (String.uncapitalize_ascii (pp_global_name Type ind_ref2) ^ "Impl")
+        | _ -> None
+      ) None branches
+    in
+    let scrut_setup =
+      if all_nullary then str (indent ^ sv_s ^ " := ") ++ pp_sc ++ fnl ()
+      else match get_impl_from_branches () with
+        | Some impl_name ->
+          str (indent ^ sv_s ^ " := any(") ++ pp_sc ++ str (").(*" ^ impl_name ^ ")") ++ fnl ()
+        | None ->
+          str (indent ^ sv_s ^ " := ") ++ pp_sc ++ fnl ()
+    in
+    let pp_brs =
+      prlist_with_sep fnl
+        (pp_go_branch env sv_s ~indent ~is_enum:all_nullary ~case_ty:exp_ty)
+        (Array.to_list branches)
+    in
+    scrut_setup
+    ++ str (indent ^ "switch " ^ switch_expr ^ " {") ++ fnl ()
+    ++ pp_brs ++ fnl ()
+    ++ str (indent ^ "}") ++ fnl ()
+    ++ str (indent ^ "panic(\"unreachable\")")
+
 (** Emit an expression as a flat sequence of Go statements at the given
     [indent] prefix (e.g. ["\t"] for function bodies, ["\t\t"] for case
     branches).
@@ -1277,6 +1381,11 @@ and pp_go_stmts env ~indent ~(exp_ty : ml_type) ast =
         str (indent ^ "return ") ++ pp_go_expr env false ~exp_ty ast )
     | _ ->
       str (indent ^ "return ") ++ pp_go_expr env false ~exp_ty ast )
+  (* Non-custom pattern match in tail position: emit as a flat switch,
+     avoiding an IIFE wrapper.  Custom matches keep their func(){...}()
+     template, so they fall through to [pp_go_expr] below. *)
+  | MLcase (ty, scrut, brs) when not (is_custom_match brs) ->
+    pp_go_case_stmts env ~indent ~exp_ty ty scrut brs
   (* Everything else: emit as the final [return] expression. *)
   | _ ->
     str (indent ^ "return ") ++ pp_go_expr env false ~exp_ty ast
