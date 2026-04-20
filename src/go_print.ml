@@ -1051,6 +1051,31 @@ and pp_go_custom_match env par ?(exp_ty : ml_type = Taxiom) scrut branches =
   let templ   = find_custom_match branches in
   let pp_sc   = pp_go_expr env false scrut in
   let sc_s    = string_of_ppcmds pp_sc in
+  (* When the scrutinee is any-typed (registered in go_any_typed_vars), the
+     template cannot use %scrut directly without boxing.  Detect this and
+     pre-assert the scrutinee to the inductive's concrete Go type so templates
+     can use %scrut without manual boxing. *)
+  let sc_s =
+    let ind_type_opt =
+      Array.fold_left (fun acc (_, _, pat, _) ->
+        match acc with Some _ -> acc | None ->
+        match pat with
+        | Pusual (GlobRef.ConstructRef ((kn, ii), _))
+        | Pcons  (GlobRef.ConstructRef ((kn, ii), _), _) ->
+          find_type_custom_opt (GlobRef.IndRef (kn, ii))
+        | _ -> None
+      ) None branches
+    in
+    let scrut_is_any =
+      match scrut with
+      | MLrel n -> Hashtbl.mem go_any_typed_vars (get_db_name n env)
+      | _ -> false
+    in
+    match ind_type_opt with
+    | Some (_, go_type) when scrut_is_any && not (String.contains go_type '%') ->
+      "(" ^ sc_s ^ ").(" ^ go_type ^ ")"
+    | _ -> sc_s
+  in
   (* Pre-process each branch: rename vars, register types, render body.
      Variables bound in custom match templates get their Go type from the
      template expression (e.g. [%b1a0 := _su_ - 1] → uint), NOT from an
