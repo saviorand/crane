@@ -367,13 +367,30 @@ let pp_go_targs ids =
 (** Counter for unique scrutinee variable names ([scrut1], [scrut2], …)
     to avoid shadowing in nested pattern matches. *)
 let scrut_counter = ref 0
-
-let fresh_scrut () =
-  incr scrut_counter;
-  Id.of_string ("scrut" ^ string_of_int !scrut_counter)
+let scrut_name_counters : (string, int) Hashtbl.t = Hashtbl.create 8
 
 (** Reset the scrutinee counter between extraction passes. *)
-let reset_scrut_counter () = scrut_counter := 0
+let reset_scrut_counter () =
+  scrut_counter := 0;
+  Hashtbl.clear scrut_name_counters
+
+(** Derive a meaningful scrutinee variable name from the scrutinee expression.
+    For [MLrel n] uses the bound name plus [suffix] ("Impl" for struct matches,
+    "" for enum or record matches).  Falls back to [scrutN] for complex exprs. *)
+let fresh_scrut_named scrut env ~suffix =
+  let base =
+    match scrut with
+    | MLrel n -> Id.to_string (get_db_name n env) ^ suffix
+    | _ ->
+      incr scrut_counter;
+      "scrut" ^ string_of_int !scrut_counter
+  in
+  match scrut with
+  | MLrel _ ->
+    let count = try Hashtbl.find scrut_name_counters base with Not_found -> 0 in
+    Hashtbl.replace scrut_name_counters base (count + 1);
+    Id.of_string (if count = 0 then base else base ^ string_of_int (count + 1))
+  | _ -> Id.of_string base
 
 (** Flatten a curried application tree.
     [MLapp(MLapp(f, a1), a2)] → [(f, a1 @ a2)].
@@ -793,8 +810,6 @@ and pp_go_case env par ty ?(exp_ty : ml_type = Taxiom) scrut branches =
   if is_custom_match branches then
     pp_go_custom_match env par ~exp_ty scrut branches
   else begin
-    let sv   = fresh_scrut () in
-    let sv_s = Id.to_string sv in
     let pp_sc = pp_go_expr env false scrut in
     let iife_ty = if is_opaque_ty exp_ty then str "any" else pp_go_type exp_ty in
     (* Check if any branch pattern comes from a record inductive.
@@ -824,87 +839,109 @@ and pp_go_case env par ty ?(exp_ty : ml_type = Taxiom) scrut branches =
           | br -> br
       in
       let (ids, _, _, body) = first_ctor_branch 0 in
-      (* Keep original mlidents to detect Dummy (blank) variables.
-         Dummy variables appear as "_" (renamed to "_0" etc.); they must not
-         be emitted as assignments to avoid "declared and not used" errors. *)
-      let ids_orig = List.map (fun (mid, _) -> mid) ids in
-      let ids_typed = List.map (fun (mid, ty') -> (id_of_mlident mid, ty')) ids in
-      let renamed_rev, env' = push_vars' (List.rev ids_typed) env in
-      let renamed = List.rev renamed_rev in
-      (* Register variables using the concrete field type from the record
-         definition (not the potentially-erased MiniML ids type), so that
-         [MLrel] does not insert spurious type assertions. *)
-      List.iteri (fun k (id', _) ->
-        let field_ty = match List.nth_opt field_info k with
-          | Some (_, ty) -> ty | None -> Taxiom
-        in
-        register_var_type id' field_ty
-      ) renamed;
-      let pp_assigns = List.mapi (fun k (id', _) ->
-        (* Skip blank-identifier variables (Dummy in MiniML). *)
-        let orig_mid = List.nth ids_orig k in
-        if orig_mid = Dummy then mt ()
-        else
-          let (fname, _) = match List.nth_opt field_info k with
-            | Some fi -> fi | None -> ("_f" ^ string_of_int k, Taxiom)
+      (* Inline: body = MLrel m on a concrete scrutinee → emit scrut.field directly. *)
+      let n_ids = List.length ids in
+      let inline_result =
+        match body with
+        | MLrel m when m >= 1 && m <= n_ids ->
+          let field_idx = n_ids - m in
+          ( match List.nth_opt field_info field_idx with
+          | Some (fname, fty) when not (is_opaque_ty fty) ->
+            ( match scrut with
+            | MLrel p when not (Hashtbl.mem go_any_typed_vars (get_db_name p env)) ->
+              let vname = Id.to_string (get_db_name p env) in
+              let expr = str (vname ^ "." ^ fname) in
+              Some (if par then str "(" ++ expr ++ str ")" else expr)
+            | _ -> None )
+          | _ -> None )
+        | _ -> None
+      in
+      ( match inline_result with
+      | Some result -> result
+      | None ->
+        let sv   = fresh_scrut_named scrut env ~suffix:"" in
+        let sv_s = Id.to_string sv in
+        (* Keep original mlidents to detect Dummy (blank) variables.
+           Dummy variables appear as "_" (renamed to "_0" etc.); they must not
+           be emitted as assignments to avoid "declared and not used" errors. *)
+        let ids_orig = List.map (fun (mid, _) -> mid) ids in
+        let ids_typed = List.map (fun (mid, ty') -> (id_of_mlident mid, ty')) ids in
+        let renamed_rev, env' = push_vars' (List.rev ids_typed) env in
+        let renamed = List.rev renamed_rev in
+        (* Register variables using the concrete field type from the record
+           definition (not the potentially-erased MiniML ids type), so that
+           [MLrel] does not insert spurious type assertions. *)
+        List.iteri (fun k (id', _) ->
+          let field_ty = match List.nth_opt field_info k with
+            | Some (_, ty) -> ty | None -> Taxiom
           in
-          str (Printf.sprintf "\t%s := %s.%s" (Id.to_string id') sv_s fname) ++ fnl ()
-      ) renamed in
-      let pp_body = pp_go_expr env' false ~exp_ty body in
-      (* Compute the IIFE return type.  When [exp_ty] is concrete, use it.
-         When it is opaque (e.g. the record match is used inside an inline
-         custom template argument that passes no [exp_ty]), infer from the
-         body variable's registered field type so that arithmetic operators
-         and comparisons on the result compile without an explicit assertion. *)
-      let effective_iife_ty =
-        if not (is_opaque_ty exp_ty) then iife_ty
-        else match body with
+          register_var_type id' field_ty
+        ) renamed;
+        let pp_assigns = List.mapi (fun k (id', _) ->
+          (* Skip blank-identifier variables (Dummy in MiniML). *)
+          let orig_mid = List.nth ids_orig k in
+          if orig_mid = Dummy then mt ()
+          else
+            let (fname, _) = match List.nth_opt field_info k with
+              | Some fi -> fi | None -> ("_f" ^ string_of_int k, Taxiom)
+            in
+            str (Printf.sprintf "\t%s := %s.%s" (Id.to_string id') sv_s fname) ++ fnl ()
+        ) renamed in
+        let pp_body = pp_go_expr env' false ~exp_ty body in
+        (* Compute the IIFE return type.  When [exp_ty] is concrete, use it.
+           When it is opaque (e.g. the record match is used inside an inline
+           custom template argument that passes no [exp_ty]), infer from the
+           body variable's registered field type so that arithmetic operators
+           and comparisons on the result compile without an explicit assertion. *)
+        let effective_iife_ty =
+          if not (is_opaque_ty exp_ty) then iife_ty
+          else match body with
+            | MLrel n ->
+              let id = get_db_name n env' in
+              let vty = lookup_var_type id in
+              if is_opaque_ty vty then iife_ty else pp_go_type vty
+            | _ -> iife_ty
+        in
+        (* If the scrutinee is [any]-typed in Go (e.g. bound from an impl-struct
+           field like [_c1_d0 any]), accessing struct fields directly on it will
+           fail at compile time.  Detect this by checking if the scrutinee MLrel
+           is in [go_any_typed_vars], and if so, box through [any] and assert to
+           the concrete record type before accessing fields. *)
+        let record_type_name =
+          Array.fold_left (fun acc (_, _, pat, _) ->
+            match acc with | Some _ -> acc | None ->
+              match pat with
+              | Pusual (GlobRef.ConstructRef ((kn2, ii2), _))
+              | Pcons  (GlobRef.ConstructRef ((kn2, ii2), _), _) ->
+                let ind_ref2 = GlobRef.IndRef (kn2, ii2) in
+                Some (pp_global_name Type ind_ref2)
+              | _ -> None
+          ) None branches
+        in
+        let scrut_is_any = match scrut with
           | MLrel n ->
-            let id = get_db_name n env' in
-            let vty = lookup_var_type id in
-            if is_opaque_ty vty then iife_ty else pp_go_type vty
-          | _ -> iife_ty
-      in
-      (* If the scrutinee is [any]-typed in Go (e.g. bound from an impl-struct
-         field like [_c1_d0 any]), accessing struct fields directly on it will
-         fail at compile time.  Detect this by checking if the scrutinee MLrel
-         is in [go_any_typed_vars], and if so, box through [any] and assert to
-         the concrete record type before accessing fields. *)
-      let record_type_name =
-        Array.fold_left (fun acc (_, _, pat, _) ->
-          match acc with | Some _ -> acc | None ->
-            match pat with
-            | Pusual (GlobRef.ConstructRef ((kn2, ii2), _))
-            | Pcons  (GlobRef.ConstructRef ((kn2, ii2), _), _) ->
-              let ind_ref2 = GlobRef.IndRef (kn2, ii2) in
-              Some (pp_global_name Type ind_ref2)
-            | _ -> None
-        ) None branches
-      in
-      let scrut_is_any = match scrut with
-        | MLrel n ->
-          let sid = get_db_name n env in
-          Hashtbl.mem go_any_typed_vars sid
-        | _ -> false
-      in
-      let scrut_setup =
-        if scrut_is_any then
-          match record_type_name with
-          | Some tn ->
-            str ("\t" ^ sv_s ^ " := any(") ++ pp_sc ++ str (").(" ^ tn ^ ")") ++ fnl ()
-          | None ->
+            let sid = get_db_name n env in
+            Hashtbl.mem go_any_typed_vars sid
+          | _ -> false
+        in
+        let scrut_setup =
+          if scrut_is_any then
+            match record_type_name with
+            | Some tn ->
+              str ("\t" ^ sv_s ^ " := any(") ++ pp_sc ++ str (").(" ^ tn ^ ")") ++ fnl ()
+            | None ->
+              str ("\t" ^ sv_s ^ " := ") ++ pp_sc ++ fnl ()
+          else
             str ("\t" ^ sv_s ^ " := ") ++ pp_sc ++ fnl ()
-        else
-          str ("\t" ^ sv_s ^ " := ") ++ pp_sc ++ fnl ()
-      in
-      let result =
-        str "(func() " ++ effective_iife_ty ++ str " {" ++ fnl ()
-        ++ scrut_setup
-        ++ prlist Fun.id pp_assigns
-        ++ str "\treturn " ++ pp_body ++ fnl ()
-        ++ str "})()"
-      in
-      if par then str "(" ++ result ++ str ")" else result
+        in
+        let result =
+          str "(func() " ++ effective_iife_ty ++ str " {" ++ fnl ()
+          ++ scrut_setup
+          ++ prlist Fun.id pp_assigns
+          ++ str "\treturn " ++ pp_body ++ fnl ()
+          ++ str "})()"
+        in
+        if par then str "(" ++ result ++ str ")" else result )
 
     | None ->
       (* ---- enum or standard tagged-struct match ---- *)
@@ -913,6 +950,31 @@ and pp_go_case env par ty ?(exp_ty : ml_type = Taxiom) scrut branches =
          switch on the tagged-struct discriminant [._v]. *)
       let all_nullary =
         Array.for_all (fun (ids, _, _, _) -> ids = []) branches
+      in
+      (* For enum switches, if the scrutinee is already a concrete named variable,
+         switch on it directly — no sv assignment needed. *)
+      let enum_direct : string option =
+        if all_nullary then
+          match scrut with
+          | MLrel n ->
+            let id = get_db_name n env in
+            if not (Hashtbl.mem go_any_typed_vars id) then Some (Id.to_string id)
+            else None
+          | _ -> None
+        else None
+      in
+      let sv_s = match enum_direct with
+        | Some name -> name
+        | None ->
+          (* For any-typed enum scrutinees, derive-from-name would create "c := c";
+             fall back to counter.  For struct matches, derive "rImpl" etc. *)
+          let sv = if all_nullary then begin
+            incr scrut_counter;
+            Id.of_string ("scrut" ^ string_of_int !scrut_counter)
+          end else
+            fresh_scrut_named scrut env ~suffix:"Impl"
+          in
+          Id.to_string sv
       in
       let switch_expr = if all_nullary then sv_s else sv_s ^ ".tag" in
       (* For non-enum structural matches, box the scrutinee through [any] and
@@ -938,17 +1000,20 @@ and pp_go_case env par ty ?(exp_ty : ml_type = Taxiom) scrut branches =
         ) None branches
       in
       let scrut_setup =
-        if all_nullary then
-          str ("\t" ^ sv_s ^ " := ") ++ pp_sc ++ fnl ()
-        else
-          match get_impl_from_branches () with
-          | Some impl_name ->
-            str ("\t" ^ sv_s ^ " := any(") ++ pp_sc ++ str (").(*" ^ impl_name ^ ")") ++ fnl ()
-          | None ->
-            (* Custom or unrecognised inductive: plain assignment.
-               If the scrutinee is [any], accessing [._v] will fail at compile
-               time; add a custom Extract Inductive directive to fix this. *)
+        match enum_direct with
+        | Some _ -> mt ()
+        | None ->
+          if all_nullary then
             str ("\t" ^ sv_s ^ " := ") ++ pp_sc ++ fnl ()
+          else
+            match get_impl_from_branches () with
+            | Some impl_name ->
+              str ("\t" ^ sv_s ^ " := any(") ++ pp_sc ++ str (").(*" ^ impl_name ^ ")") ++ fnl ()
+            | None ->
+              (* Custom or unrecognised inductive: plain assignment.
+                 If the scrutinee is [any], accessing [._v] will fail at compile
+                 time; add a custom Extract Inductive directive to fix this. *)
+              str ("\t" ^ sv_s ^ " := ") ++ pp_sc ++ fnl ()
       in
       let pp_brs =
         prlist_with_sep fnl
@@ -1227,8 +1292,6 @@ and pp_go_fix env par ?(exp_ty : ml_type = Taxiom) i defs bodies =
     Mirrors [pp_go_case] but emits the switch directly at [indent] level,
     delegating branch bodies to [pp_go_stmts] instead of [pp_go_expr]. *)
 and pp_go_case_stmts env ~indent ~(exp_ty : ml_type) _ty scrut branches =
-  let sv   = fresh_scrut () in
-  let sv_s = Id.to_string sv in
   let pp_sc = pp_go_expr env false scrut in
   let get_record_fields () =
     Array.fold_left (fun acc (_, _, pat, _) ->
@@ -1249,51 +1312,95 @@ and pp_go_case_stmts env ~indent ~(exp_ty : ml_type) _ty scrut branches =
         | br -> br
     in
     let (ids, _, _, body) = first_ctor_branch 0 in
-    let ids_orig = List.map fst ids in
-    let ids_typed = List.map (fun (mid, ty') -> (id_of_mlident mid, ty')) ids in
-    let renamed_rev, env' = push_vars' (List.rev ids_typed) env in
-    let renamed = List.rev renamed_rev in
-    List.iteri (fun k (id', _) ->
-      let field_ty = match List.nth_opt field_info k with
-        | Some (_, ty) -> ty | None -> Taxiom
-      in
-      register_var_type id' field_ty
-    ) renamed;
-    let record_type_name =
-      Array.fold_left (fun acc (_, _, pat, _) ->
-        match acc with Some _ -> acc | None ->
-        match pat with
-        | Pusual (GlobRef.ConstructRef ((kn2, ii2), _))
-        | Pcons  (GlobRef.ConstructRef ((kn2, ii2), _), _) ->
-          Some (pp_global_name Type (GlobRef.IndRef (kn2, ii2)))
-        | _ -> None
-      ) None branches
+    let n_ids = List.length ids in
+    (* Inline: body = MLrel m on a concrete scrutinee → emit return scrut.field directly. *)
+    let inline_stmt =
+      match body with
+      | MLrel m when m >= 1 && m <= n_ids ->
+        let field_idx = n_ids - m in
+        ( match List.nth_opt field_info field_idx with
+        | Some (fname, fty) when not (is_opaque_ty fty) ->
+          ( match scrut with
+          | MLrel p when not (Hashtbl.mem go_any_typed_vars (get_db_name p env)) ->
+            let vname = Id.to_string (get_db_name p env) in
+            Some (str (indent ^ "return " ^ vname ^ "." ^ fname))
+          | _ -> None )
+        | _ -> None )
+      | _ -> None
     in
-    let scrut_is_any = match scrut with
-      | MLrel n -> Hashtbl.mem go_any_typed_vars (get_db_name n env)
-      | _ -> false
-    in
-    let scrut_setup =
-      if scrut_is_any then
-        match record_type_name with
-        | Some tn ->
-          str (indent ^ sv_s ^ " := any(") ++ pp_sc ++ str (").(" ^ tn ^ ")") ++ fnl ()
-        | None -> str (indent ^ sv_s ^ " := ") ++ pp_sc ++ fnl ()
-      else str (indent ^ sv_s ^ " := ") ++ pp_sc ++ fnl ()
-    in
-    let pp_assigns = List.mapi (fun k (id', _) ->
-      if List.nth ids_orig k = Dummy then mt ()
-      else
-        let (fname, _) = match List.nth_opt field_info k with
-          | Some fi -> fi | None -> ("_f" ^ string_of_int k, Taxiom)
+    ( match inline_stmt with
+    | Some s -> s
+    | None ->
+      let sv   = fresh_scrut_named scrut env ~suffix:"" in
+      let sv_s = Id.to_string sv in
+      let ids_orig = List.map fst ids in
+      let ids_typed = List.map (fun (mid, ty') -> (id_of_mlident mid, ty')) ids in
+      let renamed_rev, env' = push_vars' (List.rev ids_typed) env in
+      let renamed = List.rev renamed_rev in
+      List.iteri (fun k (id', _) ->
+        let field_ty = match List.nth_opt field_info k with
+          | Some (_, ty) -> ty | None -> Taxiom
         in
-        str (Printf.sprintf "%s%s := %s.%s" indent (Id.to_string id') sv_s fname) ++ fnl ()
-    ) renamed in
-    scrut_setup ++ prlist Fun.id pp_assigns
-    ++ pp_go_stmts env' ~indent ~exp_ty body
+        register_var_type id' field_ty
+      ) renamed;
+      let record_type_name =
+        Array.fold_left (fun acc (_, _, pat, _) ->
+          match acc with Some _ -> acc | None ->
+          match pat with
+          | Pusual (GlobRef.ConstructRef ((kn2, ii2), _))
+          | Pcons  (GlobRef.ConstructRef ((kn2, ii2), _), _) ->
+            Some (pp_global_name Type (GlobRef.IndRef (kn2, ii2)))
+          | _ -> None
+        ) None branches
+      in
+      let scrut_is_any = match scrut with
+        | MLrel n -> Hashtbl.mem go_any_typed_vars (get_db_name n env)
+        | _ -> false
+      in
+      let scrut_setup =
+        if scrut_is_any then
+          match record_type_name with
+          | Some tn ->
+            str (indent ^ sv_s ^ " := any(") ++ pp_sc ++ str (").(" ^ tn ^ ")") ++ fnl ()
+          | None -> str (indent ^ sv_s ^ " := ") ++ pp_sc ++ fnl ()
+        else str (indent ^ sv_s ^ " := ") ++ pp_sc ++ fnl ()
+      in
+      let pp_assigns = List.mapi (fun k (id', _) ->
+        if List.nth ids_orig k = Dummy then mt ()
+        else
+          let (fname, _) = match List.nth_opt field_info k with
+            | Some fi -> fi | None -> ("_f" ^ string_of_int k, Taxiom)
+          in
+          str (Printf.sprintf "%s%s := %s.%s" indent (Id.to_string id') sv_s fname) ++ fnl ()
+      ) renamed in
+      scrut_setup ++ prlist Fun.id pp_assigns
+      ++ pp_go_stmts env' ~indent ~exp_ty body )
 
   | None ->
     let all_nullary = Array.for_all (fun (ids, _, _, _) -> ids = []) branches in
+    (* For enum switches, if the scrutinee is already a concrete named variable,
+       switch on it directly — no sv assignment needed. *)
+    let enum_direct : string option =
+      if all_nullary then
+        match scrut with
+        | MLrel n ->
+          let id = get_db_name n env in
+          if not (Hashtbl.mem go_any_typed_vars id) then Some (Id.to_string id)
+          else None
+        | _ -> None
+      else None
+    in
+    let sv_s = match enum_direct with
+      | Some name -> name
+      | None ->
+        let sv = if all_nullary then begin
+          incr scrut_counter;
+          Id.of_string ("scrut" ^ string_of_int !scrut_counter)
+        end else
+          fresh_scrut_named scrut env ~suffix:"Impl"
+        in
+        Id.to_string sv
+    in
     let switch_expr = if all_nullary then sv_s else sv_s ^ ".tag" in
     let get_impl_from_branches () =
       Array.fold_left (fun acc (_, _, pat, _) ->
@@ -1308,12 +1415,15 @@ and pp_go_case_stmts env ~indent ~(exp_ty : ml_type) _ty scrut branches =
       ) None branches
     in
     let scrut_setup =
-      if all_nullary then str (indent ^ sv_s ^ " := ") ++ pp_sc ++ fnl ()
-      else match get_impl_from_branches () with
-        | Some impl_name ->
-          str (indent ^ sv_s ^ " := any(") ++ pp_sc ++ str (").(*" ^ impl_name ^ ")") ++ fnl ()
-        | None ->
-          str (indent ^ sv_s ^ " := ") ++ pp_sc ++ fnl ()
+      match enum_direct with
+      | Some _ -> mt ()
+      | None ->
+        if all_nullary then str (indent ^ sv_s ^ " := ") ++ pp_sc ++ fnl ()
+        else match get_impl_from_branches () with
+          | Some impl_name ->
+            str (indent ^ sv_s ^ " := any(") ++ pp_sc ++ str (").(*" ^ impl_name ^ ")") ++ fnl ()
+          | None ->
+            str (indent ^ sv_s ^ " := ") ++ pp_sc ++ fnl ()
     in
     let pp_brs =
       prlist_with_sep fnl
